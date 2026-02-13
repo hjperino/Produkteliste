@@ -4,9 +4,15 @@ from datetime import datetime, timezone
 from typing import Dict, Any
 import asyncio
 
-from excel.io import load_workbook_from_bytes, map_headers, read_inputs, write_outputs, workbook_to_bytes
-from worker.galaxus import check_galaxus_product, check_keyword_rank
-from worker.toppreise import check_toppreise
+from app.excel.io import (
+    load_workbook_from_bytes,
+    map_headers,
+    read_inputs,
+    write_outputs,
+    workbook_to_bytes,
+)
+from app.worker.galaxus import check_galaxus_product, check_keyword_rank
+from app.worker.toppreise import check_toppreise
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
