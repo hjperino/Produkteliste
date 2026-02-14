@@ -16,7 +16,15 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 app = FastAPI(title="Produkteliste Bot API", version="1.0")
+from fastapi.middleware.cors import CORSMiddleware
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # --- ENV ---
 JSONBIN_API_KEY = os.environ.get("JSONBIN_API_KEY", "")
 JSONBIN_JOBS_BIN_ID = os.environ.get("JSONBIN_JOBS_BIN_ID", "")
