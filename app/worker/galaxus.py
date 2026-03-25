@@ -112,7 +112,11 @@ async def check_galaxus_product(product_id: str) -> Dict[str, Any]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-http2",
+            ],
         )
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
