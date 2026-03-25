@@ -69,7 +69,7 @@ def write_outputs(ws, headers: Dict[str, int], results_by_row: Dict[int, dict]) 
     col_img = headers.get("Min. 6 Bilder")
     col_vid = headers.get("1- 3 Videos")
     col_bul = headers.get("Produktbeschr")
-    # col_mainimg = headers.get("Gutes Mainbild")  # not filled by our steps
+    col_debug = headers.get("Gutes Mainbild")  # repurposed for debug notes
     col_price_gx = headers.get("Preis Galaxus")
     col_price_mp = headers.get("Preis Marktpreis Main")
     col_vendor_mp = headers.get("Marktpreis Anbieter Main")
@@ -89,3 +89,8 @@ def write_outputs(ws, headers: Dict[str, int], results_by_row: Dict[int, dict]) 
             ws.cell(row_idx, col_price_mp).value = res.get("toppreise_price", "")
         if col_vendor_mp:
             ws.cell(row_idx, col_vendor_mp).value = res.get("toppreise_vendor", "")
+        if col_debug:
+            notes = res.get("notes", "")
+            galaxus_url = res.get("galaxus_url", "")
+            debug_text = f"{notes} | url={galaxus_url}" if notes or galaxus_url else ""
+            ws.cell(row_idx, col_debug).value = debug_text
