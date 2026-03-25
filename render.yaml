@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: produkteliste
+    runtime: python
+    buildCommand: pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium
+    startCommand: uvicorn app.api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: JSONBIN_API_KEY
+        sync: false
+      - key: JSONBIN_JOBS_BIN_ID
+        sync: false
+      - key: JSONBIN_RESULTS_BIN_ID
+        sync: false
