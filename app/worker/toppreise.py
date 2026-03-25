@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import quote
 from typing import Dict, Any, Optional, Tuple, List
 
 from playwright.async_api import async_playwright, Page
@@ -94,7 +95,7 @@ async def check_toppreise(product_id: str) -> Dict[str, Any]:
         page = await context.new_page()
 
         await page.goto(
-            TOPPREISE_SEARCH.format(q=product_id),
+            TOPPREISE_SEARCH.format(q=quote(product_id)),
             wait_until="domcontentloaded",
             timeout=60000,
         )

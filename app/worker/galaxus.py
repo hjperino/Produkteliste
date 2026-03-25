@@ -1,6 +1,7 @@
 # worker/galaxus.py
 from __future__ import annotations
 import re
+from urllib.parse import quote
 from typing import Dict, Any, Optional, List
 from playwright.async_api import async_playwright, Page
 
@@ -116,20 +117,24 @@ async def check_galaxus_product(product_id: str) -> Dict[str, Any]:
         )
         page = await context.new_page()
 
-        await page.goto(GALAXUS_SEARCH.format(q=product_id), wait_until="domcontentloaded", timeout=60000)
+        await page.goto(GALAXUS_SEARCH.format(q=quote(product_id)), wait_until="domcontentloaded", timeout=60000)
         await _try_cookie_reject(page)
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(1500)
 
-        # Click result containing product_id (best-effort)
-        link = page.locator(f"a:has-text('{product_id}')").first
-        if await link.count() == 0:
-            # fallback: click first plausible product link card
-            # (this is a fallback; ideally refine after first live run)
-            link = page.locator("a[href*='/']").first
+        # If search redirected directly to a product page, skip click
+        if "/product/" not in page.url:
+            # Wait for product links to render (Galaxus is a SPA)
+            try:
+                await page.wait_for_selector("a[href*='/product/']", timeout=6000)
+            except Exception:
+                pass
 
-        await link.click(timeout=10000)
-        await page.wait_for_load_state("domcontentloaded")
-        await page.wait_for_timeout(900)
+            # Click the first actual product page link (not navigation/logo)
+            link = page.locator("a[href*='/product/']").first
+            if await link.count() > 0:
+                await link.click(timeout=10000)
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(900)
 
         availability_text = await extract_availability_text(page)
 
