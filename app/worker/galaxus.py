@@ -110,14 +110,20 @@ async def check_galaxus_product(product_id: str) -> Dict[str, Any]:
       url: str
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        )
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         page = await context.new_page()
 
-        await page.goto(GALAXUS_SEARCH.format(q=quote(product_id)), wait_until="domcontentloaded", timeout=60000)
+        await page.goto(GALAXUS_SEARCH.format(q=quote(product_id, safe="")), wait_until="domcontentloaded", timeout=60000)
         await _try_cookie_reject(page)
         await page.wait_for_timeout(1500)
 
@@ -182,8 +188,17 @@ async def check_keyword_rank(keyword: str, product_id: str) -> Dict[str, Any]:
     Because the Excel column for ranking was removed, we store this in JSON only.
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(viewport={"width": 1280, "height": 800})
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        )
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
         page = await context.new_page()
 
         await page.goto(GALAXUS_SEARCH.format(q=keyword), wait_until="domcontentloaded", timeout=60000)
