@@ -47,56 +47,17 @@ async def _get_attr_if_any(el, attrs: List[str]) -> str:
 
 async def extract_availability_text(page: Page) -> str:
     """
-    Goal: extract the hidden tooltip/label text behind the small icon under the main product image.
-    Typical text includes e.g.:
-      - "morgen geliefert"
-      - "Nur 3 Stück an Lager / Zwischen ... geliefert"
-      - "Mehr als 10 Stück an Lager beim Lieferanten / ..."
-    Strategy (robust, selector-light):
-      1) Search for elements with aria-label/title/data-* containing typical words.
-      2) If nothing found: hover likely icon candidates and read tooltip role='tooltip'.
+    Galaxus shows availability as innerText of span[role="button"][aria-haspopup="dialog"].
+    There are multiple such spans on the page (icons etc.) — we pick the one
+    whose text contains known availability keywords.
+    Example: "Übermorgen geliefert\nNur 2 Stück an Lager"
     """
-
-    # 1) Attribute-based search across the page (then we can narrow later if needed)
-    attribute_candidates = page.locator(
-        "[aria-label], [title], [data-tooltip], [data-original-title]"
-    )
-    n = await attribute_candidates.count()
-    for i in range(min(n, 2500)):  # cap to avoid expensive scans
-        el = attribute_candidates.nth(i)
-        s = ""
-        s = await _get_attr_if_any(el, ["aria-label", "title", "data-tooltip", "data-original-title"])
-        low = s.lower()
-        if s and any(h in low for h in AVAILABILITY_HINTS):
-            # Often availability strings are exactly what we want
-            return s
-
-    # 2) Hover-based fallback: try hovering common icon containers
-    hover_selectors = [
-        # Common tooltip triggers
-        "svg[aria-label]", "svg[title]",
-        "[data-tooltip]", "[title]",
-        # Sometimes availability icon is in a small 'info' cluster
-        "button[aria-label]", "span[aria-label]",
-    ]
-
-    for sel in hover_selectors:
-        try:
-            cand = page.locator(sel)
-            if await cand.count() == 0:
-                continue
-            el = cand.first
-            await el.hover(timeout=1500)
-            await page.wait_for_timeout(300)
-
-            tooltip = page.locator("[role='tooltip']").first
-            if await tooltip.count() > 0:
-                t = _clean(await tooltip.inner_text())
-                if t and any(h in t.lower() for h in AVAILABILITY_HINTS):
-                    return t
-        except Exception:
-            pass
-
+    spans = page.locator('span[role="button"][aria-haspopup="dialog"]')
+    n = await spans.count()
+    for i in range(n):
+        t = _clean(await spans.nth(i).inner_text())
+        if t and any(h in t.lower() for h in AVAILABILITY_HINTS):
+            return t
     return ""
 
 async def check_galaxus_product(product_id: str) -> Dict[str, Any]:
@@ -146,31 +107,48 @@ async def check_galaxus_product(product_id: str) -> Dict[str, Any]:
                 await page.wait_for_load_state("domcontentloaded")
                 await page.wait_for_timeout(900)
 
+        # Wait for SPA content to fully render
+        try:
+            await page.wait_for_selector('span[role="button"][aria-haspopup="dialog"]', timeout=5000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(500)
+
         availability_text = await extract_availability_text(page)
 
-        # --- Media counts (refine selectors later if needed) ---
-        # Prefer counting within a product gallery container if detectable.
-        # Generic fallback:
-        images_count = await page.locator("img").count()
-        videos_count = await page.locator("video").count()
+        # --- Images and videos: Galaxus shows "25 Bilder" / "1 Video" as button text ---
+        images_count = 0
+        videos_count = 0
+        btns = page.locator("button")
+        btn_n = await btns.count()
+        for i in range(min(btn_n, 60)):
+            btn_text = _clean(await btns.nth(i).inner_text())
+            m_img = re.search(r'(\d+)\s*Bilder?', btn_text)
+            if m_img:
+                images_count = int(m_img.group(1))
+            m_vid = re.search(r'(\d+)\s*Videos?', btn_text)
+            if m_vid:
+                videos_count = int(m_vid.group(1))
 
-        # --- Bullet check ---
-        # Operational: count short <li> items (<=220 chars) and require >=5.
-        lis = page.locator("li")
-        li_n = await lis.count()
-        short_li = 0
-        for i in range(min(li_n, 250)):
-            txt = _clean(await lis.nth(i).inner_text())
-            if 0 < len(txt) <= 220:
-                short_li += 1
-        bullets_ok = short_li >= 5
+        # --- Product description check (Beschreibung section > 100 chars) ---
+        bullets_ok = await page.evaluate("""() => {
+            const h = [...document.querySelectorAll('h2,h3')].find(el => el.innerText.trim() === 'Beschreibung');
+            if (!h) return false;
+            const next = h.nextElementSibling;
+            return next ? next.innerText.trim().length > 100 : false;
+        }""")
 
-        # --- Price ---
-        price_text = ""
-        price_candidates = page.locator("text=/CHF\\s*[\\d'.,]+/")
-        if await price_candidates.count() > 0:
-            price_text = _clean(await price_candidates.first.text_content())
-        price_chf = _price_to_chf(price_text)
+        # --- Price: first <strong> containing CHF ---
+        price_chf = ""
+        strongs = page.locator("strong")
+        strong_n = await strongs.count()
+        for i in range(min(strong_n, 20)):
+            t = _clean(await strongs.nth(i).inner_text())
+            if "CHF" in t:
+                m = re.search(r"([\d',.]+)", t.replace("CHF", "").strip())
+                if m:
+                    price_chf = m.group(1).replace("'", "")
+                    break
 
         url = page.url
 
