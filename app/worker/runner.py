@@ -51,6 +51,7 @@ async def run_job_excel(xlsx_bytes: bytes) -> Dict[str, Any]:
                 gx = await check_galaxus_product(inp.product_id)
                 res["galaxus_url"] = gx.get("url", "")
                 res["availability_text"] = gx.get("availability_text", "")
+                res["notes"] = gx.get("notes", "")
 
                 res["images_ok"] = (gx.get("images_count", 0) >= 6)
                 res["videos_ok"] = (gx.get("videos_count", 0) >= 1)
