@@ -1,16 +1,12 @@
 # worker/galaxus.py
 """
-Galaxus product check via persisted GraphQL queries with detailed logging.
+Galaxus product check via persisted GraphQL queries.
 
-Public functions
-----------------
-check_galaxus_product(product_id) -> dict
-    Returns availability ja/nein, image/video counts, description-OK flag,
-    galaxus price (float), main image URL, Galaxus URL, plus a 'log' string
-    that describes every step (visible in the Excel 'Debug' column).
-
-check_keyword_rank(keyword, product_id) -> dict
-    Position (1..48) of the product on Galaxus when searching for `keyword`.
+Anti-Block-Strategie:
+  - Browser-realistische Headers (sec-ch-ua, sec-fetch-*)
+  - Cookie-Warmup: zuerst /de aufrufen, Cookies einsammeln, dann erst APIs
+  - Retry mit alternativem User-Agent bei 403/leerer Antwort
+  - Detailliertes Logging in 'log' (landet in Excel-Spalte 'Debug')
 """
 from __future__ import annotations
 
@@ -38,21 +34,38 @@ DETAIL_QUERY_URL  = f"{GALAXUS_BASE}/graphql/o/{DETAIL_QUERY_ID}/productDetailPa
 
 OFFER_QUERY_URL   = f"{GALAXUS_BASE}/api/graphql/get-products-with-offer-default"
 
-DG_PORTAL = "22"  # galaxus.ch
+DG_PORTAL = "22"
 
-_HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-    "Accept-Language": "de-CH,de;q=0.9,en;q=0.7",
-    "Origin": GALAXUS_BASE,
-    "Referer": f"{GALAXUS_BASE}/de",
-    "X-Dg-Portal": DG_PORTAL,
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-}
+# Drei verschiedene User-Agents (zum Rotieren bei 403)
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+
+def _base_headers(user_agent: str) -> Dict[str, str]:
+    """Liefert browser-realistische Headers inkl. sec-ch-ua / sec-fetch-*."""
+    return {
+        "Accept": "*/*",
+        "Accept-Language": "de-CH,de;q=0.9,en;q=0.7",
+        "Content-Type": "application/json",
+        "Origin": GALAXUS_BASE,
+        "Referer": f"{GALAXUS_BASE}/de",
+        "User-Agent": user_agent,
+        "X-Dg-Portal": DG_PORTAL,
+        # apollo client identifies us as a "browser-like" GraphQL client
+        "apollographql-client-name": "shop-spa",
+        "apollographql-client-version": "1.0.0",
+        # client hints (Chrome 124)
+        "sec-ch-ua": '"Chromium";v="124", "Not-A.Brand";v="99", "Google Chrome";v="124"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -126,10 +139,26 @@ def _main_image_url(product: Dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: search by article number (with fallbacks)
+# Cookie-Warmup
 # ---------------------------------------------------------------------------
-async def _search_api(client: httpx.AsyncClient, query: str, first: int = 1) -> Tuple[List[Dict], str]:
-    """Return (nodes, log_message). log_message describes the HTTP outcome."""
+async def _warmup(client: httpx.AsyncClient) -> str:
+    """
+    Lädt die Galaxus-Startseite, damit das Server-seitige Anti-Bot uns Cookies
+    setzt. Diese Cookies sind dann auf dem AsyncClient gespeichert und werden
+    automatisch bei den folgenden API-Calls mitgesendet.
+    """
+    try:
+        r = await client.get(f"{GALAXUS_BASE}/de", timeout=15.0)
+        cookies = ";".join(client.cookies.keys()) or "none"
+        return f"warmup HTTP {r.status_code}, cookies=[{cookies}]"
+    except Exception as e:
+        return f"warmup EXC {type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Search (with auto-retry on 403 using different UA)
+# ---------------------------------------------------------------------------
+async def _search_once(client: httpx.AsyncClient, query: str, first: int) -> Tuple[List[Dict], str, int]:
     variables = {
         "query": query,
         "searchQueryConfig": {},
@@ -139,16 +168,17 @@ async def _search_api(client: httpx.AsyncClient, query: str, first: int = 1) -> 
     try:
         resp = await client.post(SEARCH_QUERY_URL, json={"variables": variables})
     except Exception as e:
-        return [], f"search '{query}' EXC {type(e).__name__}: {e}"
+        return [], f"EXC {type(e).__name__}: {e}", 0
 
-    if resp.status_code != 200:
-        snippet = resp.text[:120].replace("\n", " ")
-        return [], f"search '{query}' HTTP {resp.status_code} ({snippet!r})"
+    status = resp.status_code
+    if status != 200:
+        snippet = resp.text[:80].replace("\n", " ")
+        return [], f"HTTP {status} ({snippet!r})", status
 
     try:
         data = resp.json()
     except Exception as e:
-        return [], f"search '{query}' JSON {type(e).__name__}: {e}"
+        return [], f"JSON {type(e).__name__}: {e}", status
 
     edges = (
         (data.get("data") or {})
@@ -157,11 +187,11 @@ async def _search_api(client: httpx.AsyncClient, query: str, first: int = 1) -> 
         .get("edges", [])
     )
     nodes = [e.get("node") or {} for e in edges]
-    return nodes, f"search '{query}' -> {len(nodes)} hit(s)"
+    return nodes, f"OK {len(nodes)} hit(s)", status
 
 
 # ---------------------------------------------------------------------------
-# Step 2: product detail
+# Product detail
 # ---------------------------------------------------------------------------
 async def _fetch_product_detail(client: httpx.AsyncClient, slug: str) -> Tuple[Dict, str]:
     sector = _sector_from_slug(slug)
@@ -184,8 +214,7 @@ async def _fetch_product_detail(client: httpx.AsyncClient, slug: str) -> Tuple[D
         return {}, f"detail EXC {type(e).__name__}: {e}"
 
     if resp.status_code != 200:
-        snippet = resp.text[:120].replace("\n", " ")
-        return {}, f"detail HTTP {resp.status_code} ({snippet!r})"
+        return {}, f"detail HTTP {resp.status_code}"
 
     try:
         return resp.json(), "detail OK"
@@ -193,9 +222,6 @@ async def _fetch_product_detail(client: httpx.AsyncClient, slug: str) -> Tuple[D
         return {}, f"detail JSON {type(e).__name__}: {e}"
 
 
-# ---------------------------------------------------------------------------
-# Step 3: description via offer query
-# ---------------------------------------------------------------------------
 async def _fetch_description(client: httpx.AsyncClient, product_numeric_id: int) -> Tuple[str, str]:
     query = (
         "query {"
@@ -232,7 +258,6 @@ async def _fetch_description(client: httpx.AsyncClient, product_numeric_id: int)
 async def check_galaxus_product(product_id: str) -> Dict[str, Any]:
     log_parts: List[str] = []
 
-    # mehrere Such-Varianten ausprobieren
     queries = [product_id]
     stripped_slash = re.sub(r"/\d+$", "", product_id)
     if stripped_slash and stripped_slash != product_id:
@@ -242,48 +267,77 @@ async def check_galaxus_product(product_id: str) -> Dict[str, Any]:
         queries.append(no_slash)
 
     nodes: List[Dict] = []
-    async with httpx.AsyncClient(timeout=20.0, headers=_HEADERS, follow_redirects=True) as client:
-        for q in queries:
-            nodes, msg = await _search_api(client, q)
-            log_parts.append(msg)
+    detail_data: Dict = {}
+    description: str = ""
+
+    # Bis zu zwei User-Agent-Varianten probieren bei 403
+    for ua_idx, ua in enumerate(USER_AGENTS[:2]):
+        headers = _base_headers(ua)
+        async with httpx.AsyncClient(
+            timeout=20.0,
+            headers=headers,
+            follow_redirects=True,
+            http2=False,
+        ) as client:
+
+            # Warmup nur beim ersten Versuch ausführlich loggen
+            wm = await _warmup(client)
+            if ua_idx == 0:
+                log_parts.append(wm)
+
+            tried_any_search = False
+            for q in queries:
+                nodes, msg, status = await _search_once(client, q, first=1)
+                log_parts.append(f"search '{q}' ua{ua_idx}: {msg}")
+                tried_any_search = True
+                if nodes:
+                    break
+                if status == 403:
+                    # gleich abbrechen und mit nächstem UA neu versuchen
+                    break
+
             if nodes:
-                break
+                node = nodes[0]
+                slug = _slug_de(node.get("relativeUrl", ""))
+                product_numeric_id = _numeric_id_from_slug(slug)
+                log_parts.append(f"slug={slug}")
 
-        if not nodes:
-            return {
-                "url": "",
-                "available": "nein",
-                "images_ok": "nein",
-                "videos_ok": "nein",
-                "bullets_ok": "nein",
-                "price_chf": "",
-                "main_image_url": "",
-                "log": " | ".join(log_parts),
-            }
+                async def _empty():
+                    return "", "desc skipped (no numeric id)"
 
-        node = nodes[0]
-        slug = _slug_de(node.get("relativeUrl", ""))
-        url = GALAXUS_BASE + slug if slug else ""
-        product_numeric_id = _numeric_id_from_slug(slug)
-        log_parts.append(f"slug={slug}")
+                detail_task = asyncio.create_task(_fetch_product_detail(client, slug))
+                desc_task = asyncio.create_task(
+                    _fetch_description(client, product_numeric_id) if product_numeric_id else _empty()
+                )
 
-        # Detail + Description parallel
-        async def _empty():
-            return "", "desc skipped (no numeric id)"
+                detail_data, detail_msg = await detail_task
+                log_parts.append(detail_msg)
 
-        detail_task = asyncio.create_task(_fetch_product_detail(client, slug))
-        desc_task = asyncio.create_task(
-            _fetch_description(client, product_numeric_id) if product_numeric_id else _empty()
-        )
+                description, desc_msg = await desc_task
+                log_parts.append(desc_msg)
+                break  # erfolgreich, kein zweiter UA-Versuch nötig
 
-        detail_data, detail_msg = await detail_task
-        log_parts.append(detail_msg)
+            # nicht erfolgreich: nächster User-Agent
+            if not tried_any_search:
+                log_parts.append(f"ua{ua_idx}: no search executed")
 
-        description, desc_msg = await desc_task
-        log_parts.append(desc_msg)
+    if not nodes:
+        return {
+            "url": "",
+            "available": "nein",
+            "images_ok": "nein",
+            "videos_ok": "nein",
+            "bullets_ok": "nein",
+            "price_chf": "",
+            "main_image_url": "",
+            "log": " | ".join(log_parts),
+        }
+
+    node = nodes[0]
+    slug = _slug_de(node.get("relativeUrl", ""))
+    url = GALAXUS_BASE + slug if slug else ""
 
     product = (detail_data.get("data") or {}).get("product") or {}
-
     gallery_count = (product.get("galleryImages") or {}).get("totalCount", 0)
     video_count = (product.get("videos") or {}).get("totalCount", 0)
     log_parts.append(f"gallery={gallery_count} videos={video_count}")
@@ -331,29 +385,32 @@ async def _try_cookie_reject(page) -> None:
 
 
 async def check_keyword_rank(keyword: str, product_id: str) -> Dict[str, Any]:
-    """
-    Returns {"rank": int|"", "over_48": bool, "log": str}.
-    """
     if not keyword or not product_id:
         return {"rank": "", "over_48": False, "log": "kw skipped (empty)"}
 
-    log = ""
     async with async_playwright() as p:
         try:
             browser = await p.chromium.launch(
                 headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                ],
             )
         except Exception as e:
             return {"rank": "", "over_48": False, "log": f"kw browser EXC {e}"}
 
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
-            user_agent=_HEADERS["User-Agent"],
+            user_agent=USER_AGENTS[0],
             locale="de-CH",
+            timezone_id="Europe/Zurich",
         )
         await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            "Object.defineProperty(navigator, 'languages', {get: () => ['de-CH','de','en']});"
+            "Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});"
         )
         page = await context.new_page()
 
@@ -369,8 +426,7 @@ async def check_keyword_rank(keyword: str, product_id: str) -> Dict[str, Any]:
             for rank in range(1, 49):
                 html = await page.content()
                 if product_id in html:
-                    log = f"kw '{keyword}' -> rank {rank}"
-                    return {"rank": rank, "over_48": False, "log": log}
+                    return {"rank": rank, "over_48": False, "log": f"kw '{keyword}' -> rank {rank}"}
                 await page.mouse.wheel(0, 1200)
                 await page.wait_for_timeout(350)
             return {"rank": "", "over_48": True, "log": f"kw '{keyword}' >48"}
