@@ -3,13 +3,13 @@
 Orchestrates one full Excel run:
   - read inputs (ID + optional Keyword) from sheet
   - for each product: Galaxus check, Mainbild compare, Toppreise, Keyword rank
-  - write results back into the same sheet
+  - write results + per-row debug notes back into the same sheet
 """
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from app.excel.io import (
     load_workbook_from_bytes,
@@ -38,8 +38,7 @@ def _empty_result() -> Dict[str, Any]:
         "galaxus_price":    "",
         "toppreise_price":  "",
         "toppreise_vendor": "",
-        "galaxus_url":      "",
-        "notes":            "",
+        "debug":            "",
         "checked_at":       _iso_now(),
     }
 
@@ -52,58 +51,64 @@ async def run_job_excel(xlsx_bytes: bytes) -> Dict[str, Any]:
     inputs = read_inputs(ws, headers)
 
     results_by_row: Dict[int, dict] = {}
-    sem = asyncio.Semaphore(2)  # konservative Parallelität gegen Rate-Limits
+    sem = asyncio.Semaphore(2)
 
     async def process_one(inp):
         async with sem:
             res = _empty_result()
-            notes_parts = []
+            debug: List[str] = [f"id='{inp.product_id}'"]
 
             # --- 1. Galaxus product data ---
+            gx_main_url = ""
             try:
                 gx = await check_galaxus_product(inp.product_id)
-                res["galaxus_url"]   = gx.get("url", "")
                 res["available"]     = gx.get("available", "nein")
                 res["images_ok"]     = gx.get("images_ok", "nein")
                 res["videos_ok"]     = gx.get("videos_ok", "nein")
                 res["bullets_ok"]    = gx.get("bullets_ok", "nein")
                 res["galaxus_price"] = gx.get("price_chf", "")
                 gx_main_url          = gx.get("main_image_url", "")
-                if gx.get("notes"):
-                    notes_parts.append(f"GX: {gx['notes']}")
+                if gx.get("log"):
+                    debug.append(f"[GX] {gx['log']}")
             except Exception as e:
-                gx_main_url = ""
-                notes_parts.append(f"GX ERROR: {type(e).__name__}: {e}")
+                debug.append(f"[GX] EXC {type(e).__name__}: {e}")
 
-            # --- 2. Mainbild vergleich (philips.ch vs galaxus) ---
+            # --- 2. Mainbild ---
             try:
                 mb = await check_mainbild(inp.product_id, gx_main_url)
                 res["mainbild_ok"] = mb.get("mainbild_ok", "nein")
                 if mb.get("notes"):
-                    notes_parts.append(f"MB: {mb['notes']}")
+                    debug.append(f"[MB] {mb['notes']}")
             except Exception as e:
-                notes_parts.append(f"MB ERROR: {type(e).__name__}: {e}")
+                debug.append(f"[MB] EXC {type(e).__name__}: {e}")
 
-            # --- 3. Keyword rank (nur wenn Keyword vorhanden) ---
+            # --- 3. Keyword rank ---
             if inp.keyword:
                 try:
                     kr = await check_keyword_rank(inp.keyword, inp.product_id)
                     rank = kr.get("rank", "")
                     res["keyword_rank"] = rank if rank != "" else (">48" if kr.get("over_48") else "")
+                    if kr.get("log"):
+                        debug.append(f"[KW] {kr['log']}")
                 except Exception as e:
-                    notes_parts.append(f"KW ERROR: {type(e).__name__}: {e}")
+                    debug.append(f"[KW] EXC {type(e).__name__}: {e}")
+            else:
+                debug.append("[KW] skipped (no keyword)")
 
             # --- 4. Toppreise ---
             try:
                 tp = await check_toppreise(inp.product_id)
                 res["toppreise_price"]  = tp.get("best_price_chf", "")
                 res["toppreise_vendor"] = tp.get("vendor", "")
+                price = tp.get("best_price_chf", "")
+                vendor = tp.get("vendor", "")
+                debug.append(f"[TP] price={price} vendor='{vendor}'")
             except Exception as e:
-                notes_parts.append(f"TP ERROR: {type(e).__name__}: {e}")
+                debug.append(f"[TP] EXC {type(e).__name__}: {e}")
 
-            res["notes"] = " | ".join(notes_parts)
+            res["debug"] = " || ".join(debug)
             results_by_row[inp.row_index] = res
-            await asyncio.sleep(0.8)  # pacing
+            await asyncio.sleep(0.8)
 
     await asyncio.gather(*(process_one(i) for i in inputs))
 

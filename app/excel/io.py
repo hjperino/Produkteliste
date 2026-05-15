@@ -14,6 +14,7 @@ Spaltenlayout (Header in Zeile 3, Daten ab Zeile 4):
   - Preis Galaxus            (Output Zahl)
   - Preis Marktpreis Main    (Output Zahl)
   - Marktpreis Anbieter Main (Output Text, z.B. "Fust")
+  - Debug                    (Output Text – Status/Fehlermeldungen pro Zeile)
 """
 from __future__ import annotations
 
@@ -86,7 +87,7 @@ def write_outputs(ws, headers: Dict[str, int], results_by_row: Dict[int, dict]) 
     Schreibt die Ergebnisse zurück ins Worksheet.
     Erwartete Keys pro Zeile:
       available, images_ok, videos_ok, bullets_ok, mainbild_ok,
-      keyword_rank, galaxus_price, toppreise_price, toppreise_vendor
+      keyword_rank, galaxus_price, toppreise_price, toppreise_vendor, debug
     """
     col_available  = headers.get("Available")
     col_img        = headers.get("Min. 6 Bilder")
@@ -97,6 +98,7 @@ def write_outputs(ws, headers: Dict[str, int], results_by_row: Dict[int, dict]) 
     col_price_gx   = headers.get("Preis Galaxus")
     col_price_mp   = headers.get("Preis Marktpreis Main")
     col_vendor_mp  = headers.get("Marktpreis Anbieter Main")
+    col_debug      = headers.get("Debug")
 
     for r, res in results_by_row.items():
         _set(ws, r, col_available, res.get("available", "nein"))
@@ -108,3 +110,4 @@ def write_outputs(ws, headers: Dict[str, int], results_by_row: Dict[int, dict]) 
         _set(ws, r, col_price_gx,  res.get("galaxus_price", ""))
         _set(ws, r, col_price_mp,  res.get("toppreise_price", ""))
         _set(ws, r, col_vendor_mp, res.get("toppreise_vendor", ""))
+        _set(ws, r, col_debug,     res.get("debug", ""))

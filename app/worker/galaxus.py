@@ -1,16 +1,16 @@
 # worker/galaxus.py
 """
-Galaxus product check via persisted GraphQL queries.
+Galaxus product check via persisted GraphQL queries with detailed logging.
 
 Public functions
 ----------------
 check_galaxus_product(product_id) -> dict
     Returns availability ja/nein, image/video counts, description-OK flag,
-    galaxus price (float), main image URL, and Galaxus URL.
+    galaxus price (float), main image URL, Galaxus URL, plus a 'log' string
+    that describes every step (visible in the Excel 'Debug' column).
 
 check_keyword_rank(keyword, product_id) -> dict
-    Returns the position (1..48) of the product on Galaxus when searching
-    for `keyword`. Returns "" if not found within 48 results.
+    Position (1..48) of the product on Galaxus when searching for `keyword`.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import asyncio
 import base64
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import httpx
@@ -43,10 +43,12 @@ DG_PORTAL = "22"  # galaxus.ch
 _HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
-    "X-Dg-Portal": DG_PORTAL,
     "Accept-Language": "de-CH,de;q=0.9,en;q=0.7",
+    "Origin": GALAXUS_BASE,
+    "Referer": f"{GALAXUS_BASE}/de",
+    "X-Dg-Portal": DG_PORTAL,
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
@@ -60,7 +62,6 @@ def _clean(s: Optional[str]) -> str:
 
 
 def _strip_html(html: str) -> str:
-    """Remove HTML tags but keep paragraph/li breaks as newlines."""
     if not html:
         return ""
     s = re.sub(r"(?i)</(p|li|div|br)\s*/?>", "\n", html)
@@ -89,11 +90,6 @@ def _numeric_id_from_slug(slug: str) -> Optional[int]:
 
 
 def _availability_ja_nein(detail_product: Dict) -> str:
-    """
-    Hans-Regel:
-      "X Stück am Lager" -> ja
-      "nicht am Lager"   -> nein
-    """
     avail = (detail_product.get("availability") or {})
     mail_detail = avail.get("mailDetail") or {}
     stock = mail_detail.get("stockDetails") or {}
@@ -103,7 +99,6 @@ def _availability_ja_nein(detail_product: Dict) -> str:
     if status in ("IN_STOCK", "LOW_STOCK") and stock_count is not None and stock_count > 0:
         return "ja"
 
-    # Klassifikation als Fallback
     classification = (avail.get("mail") or {}).get("classification", "")
     if classification in ("SAME_DAY", "ONE_DAY", "TWO_DAY", "THREE_TO_FIVE_DAYS"):
         return "ja"
@@ -112,12 +107,6 @@ def _availability_ja_nein(detail_product: Dict) -> str:
 
 
 def _description_ok(description_html: str) -> bool:
-    """
-    Hans-Regel: längerer Einführungstext + mindestens 5 kurze Bullets/Absätze.
-    Wir parsen den HTML-Block in Absätze (anhand <p>, <li>, <br>, \\n) und prüfen:
-      - mindestens ein Absatz > 300 Zeichen
-      - mindestens 5 weitere Absätze (Bullets) mit je 20-400 Zeichen
-    """
     text = _strip_html(description_html)
     parts = [p.strip() for p in re.split(r"\n+", text) if p.strip()]
     long_blocks = [p for p in parts if len(p) >= 300]
@@ -137,19 +126,29 @@ def _main_image_url(product: Dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: search by article number
+# Step 1: search by article number (with fallbacks)
 # ---------------------------------------------------------------------------
-async def _search_product(query: str, first: int = 1) -> List[Dict]:
+async def _search_api(client: httpx.AsyncClient, query: str, first: int = 1) -> Tuple[List[Dict], str]:
+    """Return (nodes, log_message). log_message describes the HTTP outcome."""
     variables = {
         "query": query,
         "searchQueryConfig": {},
         "first": first,
         "sortOrder": "RELEVANCE",
     }
-    async with httpx.AsyncClient(timeout=20.0, headers=_HEADERS) as client:
+    try:
         resp = await client.post(SEARCH_QUERY_URL, json={"variables": variables})
-        resp.raise_for_status()
+    except Exception as e:
+        return [], f"search '{query}' EXC {type(e).__name__}: {e}"
+
+    if resp.status_code != 200:
+        snippet = resp.text[:120].replace("\n", " ")
+        return [], f"search '{query}' HTTP {resp.status_code} ({snippet!r})"
+
+    try:
         data = resp.json()
+    except Exception as e:
+        return [], f"search '{query}' JSON {type(e).__name__}: {e}"
 
     edges = (
         (data.get("data") or {})
@@ -157,13 +156,14 @@ async def _search_product(query: str, first: int = 1) -> List[Dict]:
         .get("products", {})
         .get("edges", [])
     )
-    return [e.get("node") or {} for e in edges]
+    nodes = [e.get("node") or {} for e in edges]
+    return nodes, f"search '{query}' -> {len(nodes)} hit(s)"
 
 
 # ---------------------------------------------------------------------------
 # Step 2: product detail
 # ---------------------------------------------------------------------------
-async def _fetch_product_detail(slug: str) -> Dict:
+async def _fetch_product_detail(client: httpx.AsyncClient, slug: str) -> Tuple[Dict, str]:
     sector = _sector_from_slug(slug)
     ninety_days_ago = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     variables = {
@@ -178,16 +178,25 @@ async def _fetch_product_detail(slug: str) -> Dict:
         "hasTrustLevelLowAndIsNotEProcurement": False,
         "adventCalendarEnabled": False,
     }
-    async with httpx.AsyncClient(timeout=20.0, headers=_HEADERS) as client:
+    try:
         resp = await client.post(DETAIL_QUERY_URL, json={"variables": variables})
-        resp.raise_for_status()
-        return resp.json()
+    except Exception as e:
+        return {}, f"detail EXC {type(e).__name__}: {e}"
+
+    if resp.status_code != 200:
+        snippet = resp.text[:120].replace("\n", " ")
+        return {}, f"detail HTTP {resp.status_code} ({snippet!r})"
+
+    try:
+        return resp.json(), "detail OK"
+    except Exception as e:
+        return {}, f"detail JSON {type(e).__name__}: {e}"
 
 
 # ---------------------------------------------------------------------------
 # Step 3: description via offer query
 # ---------------------------------------------------------------------------
-async def _fetch_description(product_numeric_id: int) -> str:
+async def _fetch_description(client: httpx.AsyncClient, product_numeric_id: int) -> Tuple[str, str]:
     query = (
         "query {"
         f" productsWithOfferDefault(productIds: [{product_numeric_id}]) {{"
@@ -196,106 +205,94 @@ async def _fetch_description(product_numeric_id: int) -> str:
         "}"
     )
     try:
-        async with httpx.AsyncClient(timeout=15.0, headers=_HEADERS) as client:
-            resp = await client.post(OFFER_QUERY_URL, json={"query": query})
-            resp.raise_for_status()
-            data = resp.json()
-            products = (
-                data.get("data", {})
-                .get("productsWithOfferDefault", {})
-                .get("products", [])
-            )
-            if products:
-                return (products[0].get("product") or {}).get("description") or ""
-    except Exception:
-        pass
-    return ""
+        resp = await client.post(OFFER_QUERY_URL, json={"query": query})
+    except Exception as e:
+        return "", f"desc EXC {type(e).__name__}: {e}"
+
+    if resp.status_code != 200:
+        return "", f"desc HTTP {resp.status_code}"
+
+    try:
+        data = resp.json()
+        products = (
+            data.get("data", {})
+            .get("productsWithOfferDefault", {})
+            .get("products", [])
+        )
+        if products:
+            return (products[0].get("product") or {}).get("description") or "", "desc OK"
+        return "", "desc empty"
+    except Exception as e:
+        return "", f"desc JSON {type(e).__name__}: {e}"
 
 
 # ---------------------------------------------------------------------------
 # Public: full product check
 # ---------------------------------------------------------------------------
 async def check_galaxus_product(product_id: str) -> Dict[str, Any]:
-    """
-    Returns dict:
-      url                : str       Galaxus product URL
-      available           : "ja"/"nein"
-      images_ok           : "ja"/"nein"   (>= 6 Bilder)
-      videos_ok           : "ja"/"nein"   (>= 1 Video)
-      bullets_ok          : "ja"/"nein"   (Langtext + >=5 Bullets)
-      price_chf           : float | ""    reine Zahl
-      main_image_url      : str
-      notes               : str           Debug info
-    """
-    notes = ""
+    log_parts: List[str] = []
 
-    # Suche: zuerst mit Original-ID, dann ohne "/00" falls leer
-    try:
-        nodes = await _search_product(product_id)
-    except Exception as e:
-        nodes = []
-        notes = f"Search API: {e}"
+    # mehrere Such-Varianten ausprobieren
+    queries = [product_id]
+    stripped_slash = re.sub(r"/\d+$", "", product_id)
+    if stripped_slash and stripped_slash != product_id:
+        queries.append(stripped_slash)
+    no_slash = product_id.replace("/", " ")
+    if no_slash not in queries:
+        queries.append(no_slash)
 
-    if not nodes:
-        stripped = re.sub(r"/\d+$", "", product_id)
-        if stripped and stripped != product_id:
-            try:
-                nodes = await _search_product(stripped)
-                if nodes:
-                    notes = f"gefunden mit Fallback-Query '{stripped}'"
-            except Exception as e:
-                notes += f" | Fallback search: {e}"
+    nodes: List[Dict] = []
+    async with httpx.AsyncClient(timeout=20.0, headers=_HEADERS, follow_redirects=True) as client:
+        for q in queries:
+            nodes, msg = await _search_api(client, q)
+            log_parts.append(msg)
+            if nodes:
+                break
 
-    if not nodes:
-        return {
-            "url": "",
-            "available": "nein",
-            "images_ok": "nein",
-            "videos_ok": "nein",
-            "bullets_ok": "nein",
-            "price_chf": "",
-            "main_image_url": "",
-            "notes": notes or f"Produkt nicht gefunden: '{product_id}'",
-        }
+        if not nodes:
+            return {
+                "url": "",
+                "available": "nein",
+                "images_ok": "nein",
+                "videos_ok": "nein",
+                "bullets_ok": "nein",
+                "price_chf": "",
+                "main_image_url": "",
+                "log": " | ".join(log_parts),
+            }
 
-    node = nodes[0]
-    slug = _slug_de(node.get("relativeUrl", ""))
-    url = GALAXUS_BASE + slug if slug else ""
-    product_numeric_id = _numeric_id_from_slug(slug)
+        node = nodes[0]
+        slug = _slug_de(node.get("relativeUrl", ""))
+        url = GALAXUS_BASE + slug if slug else ""
+        product_numeric_id = _numeric_id_from_slug(slug)
+        log_parts.append(f"slug={slug}")
 
-    # Detail + Description parallel
-    async def _empty() -> str:
-        return ""
+        # Detail + Description parallel
+        async def _empty():
+            return "", "desc skipped (no numeric id)"
 
-    detail_task = asyncio.create_task(_fetch_product_detail(slug))
-    desc_task = asyncio.create_task(
-        _fetch_description(product_numeric_id) if product_numeric_id else _empty()
-    )
+        detail_task = asyncio.create_task(_fetch_product_detail(client, slug))
+        desc_task = asyncio.create_task(
+            _fetch_description(client, product_numeric_id) if product_numeric_id else _empty()
+        )
 
-    try:
-        detail_data = await detail_task
-    except Exception as e:
-        detail_data = {}
-        notes += f" | Detail API: {e}"
+        detail_data, detail_msg = await detail_task
+        log_parts.append(detail_msg)
 
-    try:
-        description = await desc_task
-    except Exception as e:
-        description = ""
-        notes += f" | Desc API: {e}"
+        description, desc_msg = await desc_task
+        log_parts.append(desc_msg)
 
     product = (detail_data.get("data") or {}).get("product") or {}
 
     gallery_count = (product.get("galleryImages") or {}).get("totalCount", 0)
     video_count = (product.get("videos") or {}).get("totalCount", 0)
+    log_parts.append(f"gallery={gallery_count} videos={video_count}")
 
     available = _availability_ja_nein(product) if product else "nein"
 
-    # Preis als reine Zahl
     price_obj = product.get("price") or {}
     price_val = price_obj.get("amountInclusive")
     if price_val is None:
-        # Fallback aus Search-Result
         price_val = (node.get("price") or {}).get("amountInclusive")
     try:
         price_chf = float(price_val) if price_val is not None and price_val != "" else ""
@@ -310,7 +307,7 @@ async def check_galaxus_product(product_id: str) -> Dict[str, Any]:
         "bullets_ok": "ja" if _description_ok(description) else "nein",
         "price_chf": price_chf,
         "main_image_url": _main_image_url(product),
-        "notes": notes.strip(" |"),
+        "log": " | ".join(log_parts),
     }
 
 
@@ -335,17 +332,21 @@ async def _try_cookie_reject(page) -> None:
 
 async def check_keyword_rank(keyword: str, product_id: str) -> Dict[str, Any]:
     """
-    Returns {"rank": int|"", "over_48": bool}.
-    Scrolls the search-result page until the product_id appears in the DOM.
+    Returns {"rank": int|"", "over_48": bool, "log": str}.
     """
     if not keyword or not product_id:
-        return {"rank": "", "over_48": False}
+        return {"rank": "", "over_48": False, "log": "kw skipped (empty)"}
 
+    log = ""
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
+        try:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
+        except Exception as e:
+            return {"rank": "", "over_48": False, "log": f"kw browser EXC {e}"}
+
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=_HEADERS["User-Agent"],
@@ -356,22 +357,25 @@ async def check_keyword_rank(keyword: str, product_id: str) -> Dict[str, Any]:
         )
         page = await context.new_page()
 
-        await page.goto(
-            GALAXUS_SEARCH.format(q=quote(keyword, safe="")),
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-        await _try_cookie_reject(page)
-        await page.wait_for_timeout(800)
-
         try:
+            await page.goto(
+                GALAXUS_SEARCH.format(q=quote(keyword, safe="")),
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            await _try_cookie_reject(page)
+            await page.wait_for_timeout(800)
+
             for rank in range(1, 49):
                 html = await page.content()
                 if product_id in html:
-                    return {"rank": rank, "over_48": False}
+                    log = f"kw '{keyword}' -> rank {rank}"
+                    return {"rank": rank, "over_48": False, "log": log}
                 await page.mouse.wheel(0, 1200)
                 await page.wait_for_timeout(350)
-            return {"rank": "", "over_48": True}
+            return {"rank": "", "over_48": True, "log": f"kw '{keyword}' >48"}
+        except Exception as e:
+            return {"rank": "", "over_48": False, "log": f"kw EXC {type(e).__name__}: {e}"}
         finally:
             await context.close()
             await browser.close()
