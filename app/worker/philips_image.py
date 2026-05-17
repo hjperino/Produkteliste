@@ -52,10 +52,18 @@ async def _try_cookie_accept(page: Page) -> None:
             pass
 
 
+_CHROMIUM_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-http2",
+    "--disable-features=IsolateOrigins,site-per-process",
+]
+
+
 async def _get_philips_main_image(product_id: str) -> str:
     """Return the URL of the Philips product hero image, or '' if not found."""
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = await p.chromium.launch(headless=True, args=_CHROMIUM_ARGS)
         ctx = await browser.new_context(locale="de-CH",
                                         viewport={"width": 1280, "height": 900})
         page = await ctx.new_page()
